@@ -1,9 +1,14 @@
 """Support for WiiM Media Players."""
 
 from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import suppress
 from functools import wraps
+from hashlib import sha1
+from http import HTTPStatus
 from typing import Any, Concatenate
+from urllib.parse import urlparse
 
+import aiohttp
 from async_upnp_client.client import UpnpService, UpnpStateVariable
 from wiim.consts import PlayingStatus as SDKPlayingStatus
 from wiim.exceptions import WiimDeviceException, WiimException, WiimRequestException
@@ -31,6 +36,7 @@ from homeassistant.components.media_player import (
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
@@ -50,6 +56,7 @@ MEDIA_CONTENT_ID_FAVORITES = (
 MEDIA_CONTENT_ID_PLAYLISTS = (
     f"{MEDIA_TYPE_WIIM_LIBRARY}/{MEDIA_CONTENT_ID_ROOT}/playlists"
 )
+MEDIA_IMAGE_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
 def _group_member_state_signal(member_udn: str) -> str:
@@ -187,17 +194,53 @@ class WiimMediaPlayerEntity(WiimBaseEntity, MediaPlayerEntity):
         return self._wiim_data.controller.get_device(group_snapshot.leader_udn)
 
     @callback
+    def _is_local_https_media_image(self, url: str) -> bool:
+        """Return True if the media image is served by the current metadata device over HTTPS."""
+        parsed_url = urlparse(url)
+        if parsed_url.scheme != "https" or not parsed_url.hostname:
+            return False
+
+        return parsed_url.hostname == self._metadata_device.ip_address
+
+    @callback
     def _clear_media_metadata(self) -> None:
         """Clear media metadata attributes."""
         self._attr_media_title = None
         self._attr_media_artist = None
         self._attr_media_album_name = None
         self._attr_media_image_url = None
+        self._attr_media_image_hash = None
         self._attr_media_content_id = None
         self._attr_media_content_type = None
         self._attr_media_duration = None
         self._attr_media_position = None
         self._attr_media_position_updated_at = None
+
+    @callback
+    def _set_media_image_hash(
+        self,
+        *,
+        image_url: str | None,
+        media_uri: str | None,
+        title: str | None,
+        artist: str | None,
+        album: str | None,
+    ) -> None:
+        """Set a cache-busting media image hash for Home Assistant.
+
+        Some WiiM sources reuse the same artwork URL across tracks, so the
+        default HA URL-based hash is not sufficient to invalidate the image cache.
+        """
+        if not image_url:
+            self._attr_media_image_hash = None
+            return
+
+        digest_source = "|".join(
+            value or "" for value in (image_url, media_uri, title, artist, album)
+        )
+        self._attr_media_image_hash = sha1(
+            digest_source.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
 
     @callback
     def _get_command_target_device(self, action_name: str) -> WiimDevice:
@@ -317,6 +360,13 @@ class WiimMediaPlayerEntity(WiimBaseEntity, MediaPlayerEntity):
             self._attr_media_artist = media.artist
             self._attr_media_album_name = media.album
             self._attr_media_image_url = media.image_url
+            self._set_media_image_hash(
+                image_url=media.image_url,
+                media_uri=media.uri,
+                title=media.title,
+                artist=media.artist,
+                album=media.album,
+            )
             self._attr_media_content_id = media.uri
             self._attr_media_content_type = MediaType.MUSIC
             self._attr_media_duration = media.duration
@@ -705,6 +755,41 @@ class WiimMediaPlayerEntity(WiimBaseEntity, MediaPlayerEntity):
         await self._get_command_target_device("select_source").async_set_play_mode(
             source
         )
+
+    async def async_get_media_image(self) -> tuple[bytes | None, str | None]:
+        """Fetch the current media image.
+
+        Bypass HA's URL-only image cache for device-local HTTPS artwork so
+        same-URL images can still refresh when the media metadata changes.
+        """
+        if (url := self.media_image_url) is None:
+            return None, None
+
+        if not self._is_local_https_media_image(url):
+            return await super().async_get_media_image()
+
+        content, content_type = None, None
+        websession = async_get_clientsession(self.hass)
+        with suppress(TimeoutError, aiohttp.ClientError):
+            async with websession.get(
+                url,
+                ssl=False,
+                timeout=MEDIA_IMAGE_FETCH_TIMEOUT,
+            ) as response:
+                if response.status == HTTPStatus.OK:
+                    content = await response.read()
+                    if response.headers.get("Content-Type"):
+                        content_type = response.headers["Content-Type"].split(";")[0]
+
+        if content is None:
+            LOGGER.debug(
+                "Avoid retrying the default media-image fetch after a failed local HTTPS fetch for %s from %s",
+                self.entity_id,
+                url,
+            )
+            return None, None
+
+        return content, content_type
 
     async def async_browse_media(
         self,

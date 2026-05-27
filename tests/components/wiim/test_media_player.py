@@ -725,6 +725,80 @@ async def test_browse_media_service_includes_media_sources_when_supported(
     ]
 
 
+async def test_local_https_media_image_is_fetched_without_ssl_verification(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_wiim_device: MagicMock,
+    mock_wiim_controller: MagicMock,
+) -> None:
+    """Test local HTTPS artwork is fetched directly with ssl disabled."""
+    await setup_integration(hass, mock_config_entry)
+    image_url = "https://192.168.1.100/album-art.jpg"
+    mock_wiim_device.current_media = WiimMediaMetadata(
+        title="Local Art",
+        uri="http://example.com/local-art.flac",
+        image_url=image_url,
+    )
+    await fire_general_update(hass, mock_wiim_device)
+
+    entity = hass.data[DATA_COMPONENT].get_entity(MEDIA_PLAYER_ENTITY_ID)
+    response = MagicMock()
+    response.status = 200
+    response.headers = {"Content-Type": "image/jpeg; charset=binary"}
+    response.read = AsyncMock(return_value=b"image-bytes")
+    request_context = MagicMock()
+    request_context.__aenter__ = AsyncMock(return_value=response)
+    request_context.__aexit__ = AsyncMock(return_value=None)
+    websession = MagicMock()
+    websession.get.return_value = request_context
+
+    with patch(
+        "homeassistant.components.wiim.media_player.async_get_clientsession",
+        return_value=websession,
+    ):
+        content, content_type = await entity.async_get_media_image()
+
+    assert content == b"image-bytes"
+    assert content_type == "image/jpeg"
+    websession.get.assert_called_once()
+    assert websession.get.call_args.args == (image_url,)
+    assert websession.get.call_args.kwargs["ssl"] is False
+
+
+async def test_media_image_hash_changes_for_same_local_artwork_url(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_wiim_device: MagicMock,
+    mock_wiim_controller: MagicMock,
+) -> None:
+    """Test media image hash changes when local artwork URL is reused."""
+    await setup_integration(hass, mock_config_entry)
+    image_url = "https://192.168.1.100/album-art.jpg"
+
+    mock_wiim_device.current_media = WiimMediaMetadata(
+        title="First Song",
+        artist="Artist",
+        album="Album",
+        uri="http://example.com/first.flac",
+        image_url=image_url,
+    )
+    await fire_general_update(hass, mock_wiim_device)
+    entity = hass.data[DATA_COMPONENT].get_entity(MEDIA_PLAYER_ENTITY_ID)
+    first_hash = entity.media_image_hash
+
+    mock_wiim_device.current_media = WiimMediaMetadata(
+        title="Second Song",
+        artist="Artist",
+        album="Album",
+        uri="http://example.com/second.flac",
+        image_url=image_url,
+    )
+    await fire_general_update(hass, mock_wiim_device)
+
+    assert entity.media_image_url == image_url
+    assert entity.media_image_hash != first_hash
+
+
 async def test_join_and_unjoin_services_use_resolved_member_udns(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
